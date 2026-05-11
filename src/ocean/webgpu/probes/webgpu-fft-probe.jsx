@@ -1,9 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
+import {
+  FFT_SIZE,
+  FFT_LOG_SIZE,
+  OCEAN_SIZE,
+  DEFAULT_OCEAN_SETTINGS,
+} from '../engine/settings/ocean-settings.js';
+import { createSpectrumModes } from '../engine/utils/spectrum.js';
 
-const FFT_SIZE = 128;
-const FFT_LOG_SIZE = 7;
-const OCEAN_SIZE = 360;
+const SETTINGS = DEFAULT_OCEAN_SETTINGS;
 
 const computeSpectrumShader = /* wgsl */ `
 struct SpectrumMode {
@@ -502,144 +507,6 @@ fn fsMain(input: VertexOut) -> @location(0) vec4f {
 }
 `;
 
-function mulberry32(seed) {
-  return function random() {
-    let t = (seed += 0x6d2b79f5);
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function gaussianRandom(random) {
-  let u = 0;
-  let v = 0;
-
-  while (u === 0) u = random();
-  while (v === 0) v = random();
-
-  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
-}
-
-function createSpectrumModes({
-  size,
-  oceanSize,
-  windSpeed,
-  windDirection,
-  targetStd = 1.0,
-}) {
-  const random = mulberry32(1337);
-
-  const g = 9.81;
-  const windAngle = THREE.MathUtils.degToRad(windDirection);
-  const wind = new THREE.Vector2(Math.cos(windAngle), Math.sin(windAngle));
-
-  const h0 = new Array(size * size);
-
-  const L = Math.max((windSpeed * windSpeed) / g, 0.001);
-  const smallWaveDamp = 0.018;
-  const phillipsA = 1.0;
-  const windPower = 6;
-
-  let amplitudeEnergy = 0;
-
-  for (let y = 0; y < size; y += 1) {
-    for (let x = 0; x < size; x += 1) {
-      const sx = x < size / 2 ? x : x - size;
-      const sy = y < size / 2 ? y : y - size;
-
-      const kx = (2 * Math.PI * sx) / oceanSize;
-      const kz = (2 * Math.PI * sy) / oceanSize;
-
-      const kLength = Math.sqrt(kx * kx + kz * kz);
-
-      let real = 0;
-      let imag = 0;
-      let directionWeight = 0;
-      let omega = 0;
-
-      if (kLength > 0.00001) {
-        const kDir = new THREE.Vector2(kx / kLength, kz / kLength);
-        const alignment = kDir.dot(wind);
-
-        const forward = Math.max(alignment, 0);
-        const backward = Math.max(-alignment, 0);
-
-        directionWeight =
-          Math.pow(forward, windPower) +
-          Math.pow(backward, 2) * 0.035;
-
-        const phillips =
-          phillipsA *
-          (Math.exp(-1 / Math.pow(kLength * L, 2)) /
-            Math.pow(kLength, 4)) *
-          directionWeight *
-          Math.exp(-kLength * kLength * smallWaveDamp * smallWaveDamp);
-
-        const spectrumAmplitude = Math.sqrt(Math.max(phillips, 0) / 2);
-
-        real = gaussianRandom(random) * spectrumAmplitude;
-        imag = gaussianRandom(random) * spectrumAmplitude;
-
-        omega = Math.sqrt(g * kLength);
-      }
-
-      const index = y * size + x;
-
-      h0[index] = {
-        kx,
-        kz,
-        real,
-        imag,
-        omega,
-        directionWeight,
-      };
-
-      amplitudeEnergy += real * real + imag * imag;
-    }
-  }
-
-  const currentStd = Math.sqrt(Math.max(amplitudeEnergy, 0.000001));
-  const normalizeFactor = targetStd / currentStd;
-
-  const modes = new Float32Array(size * size * 8);
-
-  let pointer = 0;
-
-  for (let y = 0; y < size; y += 1) {
-    for (let x = 0; x < size; x += 1) {
-      const index = y * size + x;
-
-      const xNeg = (size - x) % size;
-      const yNeg = (size - y) % size;
-      const negIndex = yNeg * size + xNeg;
-
-      const mode = h0[index];
-      const negMode = h0[negIndex];
-
-      const h0Real = mode.real * normalizeFactor;
-      const h0Imag = mode.imag * normalizeFactor;
-
-      const h0NegConjReal = negMode.real * normalizeFactor;
-      const h0NegConjImag = -negMode.imag * normalizeFactor;
-
-      modes[pointer + 0] = mode.kx;
-      modes[pointer + 1] = mode.kz;
-      modes[pointer + 2] = h0Real;
-      modes[pointer + 3] = h0Imag;
-
-      modes[pointer + 4] = h0NegConjReal;
-      modes[pointer + 5] = h0NegConjImag;
-      modes[pointer + 6] = mode.omega;
-      modes[pointer + 7] = mode.directionWeight;
-
-      pointer += 8;
-    }
-  }
-
-  return modes;
-}
-
 function createGridIndices(size) {
   const cells = size - 1;
   const indices = new Uint32Array(cells * cells * 6);
@@ -685,20 +552,20 @@ export default function WebGPUFFTProbe() {
   const frameRef = useRef(null);
 
   const controlRef = useRef({
-    yaw: 0.02,
-    pitch: -0.12,
-    distance: 88,
+    yaw: SETTINGS.camera.initialYaw,
+    pitch: SETTINGS.camera.initialPitch,
+    distance: SETTINGS.camera.initialDistance,
     dragging: false,
     lastX: 0,
     lastY: 0,
   });
 
   const [status, setStatus] = useState(
-    'Initializing GPU IFFT / Stockham foundation...'
+    'Initializing modular GPU IFFT foundation...'
   );
 
   const [details, setDetails] = useState(
-    'Preparing h(k,t), horizontal FFT, vertical FFT, and sample buffers.'
+    'Using shared engine settings and reusable spectrum generation.'
   );
 
   useEffect(() => {
@@ -761,9 +628,14 @@ export default function WebGPUFFTProbe() {
       const spectrumModes = createSpectrumModes({
         size: FFT_SIZE,
         oceanSize: OCEAN_SIZE,
-        windSpeed: 18,
-        windDirection: 25,
-        targetStd: 1.0,
+        windSpeed: SETTINGS.windSpeed,
+        windDirection: SETTINGS.windDirection,
+        targetStd: SETTINGS.spectrum.targetStd,
+        seed: SETTINGS.spectrum.seed,
+        gravity: SETTINGS.spectrum.gravity,
+        phillipsA: SETTINGS.spectrum.phillipsA,
+        windPower: SETTINGS.spectrum.windPower,
+        smallWaveDamp: SETTINGS.spectrum.smallWaveDamp,
       });
 
       const spectrumBuffer = device.createBuffer({
@@ -921,8 +793,19 @@ export default function WebGPUFFTProbe() {
         ],
       });
 
-      const camera = new THREE.PerspectiveCamera(46, 1, 0.1, 2600);
-      const target = new THREE.Vector3(0, 0.2, -44);
+      const camera = new THREE.PerspectiveCamera(
+        SETTINGS.camera.fov,
+        1,
+        SETTINGS.camera.near,
+        SETTINGS.camera.far
+      );
+
+      const target = new THREE.Vector3(
+        SETTINGS.camera.target.x,
+        SETTINGS.camera.target.y,
+        SETTINGS.camera.target.z
+      );
+
       const viewProjection = new THREE.Matrix4();
       const uniformArray = new Float32Array(36);
 
@@ -933,7 +816,10 @@ export default function WebGPUFFTProbe() {
 
         const width = Math.max(1, wrapRef.current.clientWidth);
         const height = Math.max(1, wrapRef.current.clientHeight);
-        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const dpr = Math.min(
+          window.devicePixelRatio || 1,
+          SETTINGS.renderer.maxDevicePixelRatio
+        );
 
         canvas.width = Math.floor(width * dpr);
         canvas.height = Math.floor(height * dpr);
@@ -970,7 +856,8 @@ export default function WebGPUFFTProbe() {
 
         camera.position.set(
           Math.sin(controls.yaw) * horizontal,
-          Math.sin(controls.pitch) * controls.distance + 14,
+          Math.sin(controls.pitch) * controls.distance +
+            SETTINGS.camera.heightOffset,
           Math.cos(controls.yaw) * horizontal
         );
 
@@ -989,21 +876,21 @@ export default function WebGPUFFTProbe() {
         uniformArray[0] = timeSeconds + 60.0;
         uniformArray[1] = FFT_SIZE;
         uniformArray[2] = OCEAN_SIZE;
-        uniformArray[3] = 18.0;
+        uniformArray[3] = SETTINGS.windSpeed;
 
-        uniformArray[4] = 1.28;
-        uniformArray[5] = 1.04;
-        uniformArray[6] = 1.0;
-        uniformArray[7] = 0.24;
+        uniformArray[4] = SETTINGS.waveHeight;
+        uniformArray[5] = SETTINGS.choppiness;
+        uniformArray[6] = SETTINGS.spectrumStrength;
+        uniformArray[7] = SETTINGS.foamStrength;
 
-        uniformArray[8] = 0.88;
-        uniformArray[9] = 25.0;
+        uniformArray[8] = SETTINGS.bodyDetail;
+        uniformArray[9] = SETTINGS.windDirection;
         uniformArray[10] = 0.0;
         uniformArray[11] = 0.0;
 
-        uniformArray[12] = -0.48;
-        uniformArray[13] = 0.58;
-        uniformArray[14] = 0.66;
+        uniformArray[12] = SETTINGS.sunDirection.x;
+        uniformArray[13] = SETTINGS.sunDirection.y;
+        uniformArray[14] = SETTINGS.sunDirection.z;
         uniformArray[15] = 0.0;
 
         uniformArray[16] = camera.position.x;
@@ -1068,12 +955,19 @@ export default function WebGPUFFTProbe() {
         const colorView = context.getCurrentTexture().createView();
         const depthView = depthTexture.createView();
 
+        const clear = SETTINGS.renderer.clearColor;
+
         const renderPass = encoder.beginRenderPass({
           label: 'GPU IFFT ocean render pass',
           colorAttachments: [
             {
               view: colorView,
-              clearValue: { r: 0.53, g: 0.68, b: 0.78, a: 1 },
+              clearValue: {
+                r: clear.r,
+                g: clear.g,
+                b: clear.b,
+                a: clear.a,
+              },
               loadOp: 'clear',
               storeOp: 'store',
             },
@@ -1099,15 +993,15 @@ export default function WebGPUFFTProbe() {
 
       frame();
 
-      setStatus('v0.18-D GPU IFFT / Stockham Foundation is running.');
+      setStatus('v0.18.6 Modular GPU IFFT Foundation is running.');
       setDetails(
-        `${FFT_SIZE}x${FFT_SIZE} h(k,t) spectrum → horizontal FFT → vertical FFT → displacement/normal sample buffer. Next: displacement texture + normal texture output.`
+        `${FFT_SIZE}x${FFT_SIZE} FFT route now uses shared engine settings + reusable spectrum generation. Next: extract buffers and shader modules.`
       );
     }
 
     init().catch((error) => {
       console.error(error);
-      setStatus('WebGPU GPU IFFT foundation failed.');
+      setStatus('WebGPU modular GPU IFFT foundation failed.');
       setDetails(error?.message || 'Unknown WebGPU error.');
     });
 
@@ -1234,7 +1128,7 @@ export default function WebGPUFFTProbe() {
             color: 'rgba(205, 244, 255, 0.9)',
           }}
         >
-          OceanShader Pro / v0.18-D
+          OceanShader Pro / v0.18.6
         </p>
 
         <h1
@@ -1245,7 +1139,7 @@ export default function WebGPUFFTProbe() {
             letterSpacing: '-0.055em',
           }}
         >
-          GPU IFFT / Stockham Foundation
+          Modular GPU IFFT Foundation
         </h1>
 
         <p
