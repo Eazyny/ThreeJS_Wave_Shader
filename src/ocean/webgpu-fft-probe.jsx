@@ -38,44 +38,99 @@ struct Params {
   viewProjection: mat4x4f,
 };
 
+struct Synthesis {
+  position: vec4f,
+  normal: vec4f,
+};
+
 @group(0) @binding(0) var<storage, read_write> samples: array<Sample>;
 @group(0) @binding(1) var<uniform> params: Params;
 @group(0) @binding(2) var<storage, read> modes: array<SpectrumMode>;
 
 const MODE_COUNT: u32 = ${SPECTRUM_MODE_COUNT}u;
 
-fn spectrum_height_chop(worldXZ: vec2f) -> vec4f {
+fn complex_mul(a: vec2f, b: vec2f) -> vec2f {
+  return vec2f(
+    a.x * b.x - a.y * b.y,
+    a.x * b.y + a.y * b.x
+  );
+}
+
+fn complex_add(a: vec2f, b: vec2f) -> vec2f {
+  return vec2f(a.x + b.x, a.y + b.y);
+}
+
+fn synthesize(worldXZ: vec2f) -> Synthesis {
   var height = 0.0;
+  var gradient = vec2f(0.0);
   var chop = vec2f(0.0);
 
   let scaledXZ = worldXZ * max(params.waveScale, 0.001);
+  let globalScale = params.waveHeight * params.spectrumStrength;
 
   for (var i: u32 = 0u; i < MODE_COUNT; i = i + 1u) {
     let mode = modes[i];
 
     let k = mode.data0.xy;
-    let amp = mode.data0.z;
-    let phase0 = mode.data0.w;
-    let omega = mode.data1.x;
-    let directionWeight = mode.data1.y;
+    let h0 = mode.data0.zw;
+    let h0NegConj = mode.data1.xy;
+    let omega = mode.data1.z;
+    let directionWeight = mode.data1.w;
 
     let kLen = max(length(k), 0.0001);
     let kDir = k / kLen;
 
-    let phase = dot(k, scaledXZ) + omega * params.time + phase0;
+    let wt = omega * params.time;
 
-    let c = cos(phase);
-    let s = sin(phase);
+    let expPos = vec2f(cos(wt), sin(wt));
+    let expNeg = vec2f(cos(-wt), sin(-wt));
 
-    let weightedAmp = amp * params.waveHeight * params.spectrumStrength;
+    let hkt = complex_add(
+      complex_mul(h0, expPos),
+      complex_mul(h0NegConj, expNeg)
+    ) * globalScale;
 
-    height += c * weightedAmp;
+    let phase = dot(k, scaledXZ);
+    let spatialExp = vec2f(cos(phase), sin(phase));
 
-    let chopPower = params.choppiness * mix(0.45, 1.15, directionWeight);
-    chop += kDir * s * weightedAmp * chopPower;
+    let spatial = complex_mul(hkt, spatialExp);
+
+    height += spatial.x;
+
+    /*
+      Gradient:
+      d/dx real(h * e^(ikx)) = real(i * kx * h * e^(ikx))
+      real(i * spatial) = -imag(spatial)
+    */
+    gradient += -k * spatial.y;
+
+    /*
+      Choppy displacement:
+      D = -i * k/|k| * h(k,t)
+      real(-i * spatial) = imag(spatial)
+    */
+    let chopWeight = params.choppiness * mix(0.55, 1.20, directionWeight);
+    chop += kDir * spatial.y * chopWeight;
   }
 
-  return vec4f(height, chop.x, chop.y, 0.0);
+  let normal = normalize(vec3f(
+    -gradient.x,
+    1.0,
+    -gradient.y
+  ));
+
+  var out: Synthesis;
+
+  out.position = vec4f(
+    worldXZ.x + chop.x,
+    height,
+    worldXZ.y + chop.y,
+    height
+  );
+
+  out.normal = vec4f(normal, length(gradient));
+
+  return out;
 }
 
 @compute @workgroup_size(256)
@@ -96,34 +151,10 @@ fn csMain(@builtin(global_invocation_id) globalId: vec3u) {
   let gz = f32(iz) / f32(gridSize - 1u) - 0.5;
 
   let base = vec2f(gx * params.oceanSize, gz * params.oceanSize);
+  let result = synthesize(base);
 
-  let result = spectrum_height_chop(base);
-
-  let height = result.x;
-  let chopX = result.y;
-  let chopZ = result.z;
-
-  let eps = 0.65;
-
-  let hL = spectrum_height_chop(base - vec2f(eps, 0.0)).x;
-  let hR = spectrum_height_chop(base + vec2f(eps, 0.0)).x;
-  let hD = spectrum_height_chop(base - vec2f(0.0, eps)).x;
-  let hU = spectrum_height_chop(base + vec2f(0.0, eps)).x;
-
-  let normal = normalize(vec3f(
-    -(hR - hL),
-    2.0 * eps,
-    -(hU - hD)
-  ));
-
-  samples[id].position = vec4f(
-    base.x + chopX,
-    height,
-    base.y + chopZ,
-    height
-  );
-
-  samples[id].normal = vec4f(normal, 0.0);
+  samples[id].position = result.position;
+  samples[id].normal = result.normal;
 }
 `;
 
@@ -160,6 +191,7 @@ struct VertexOut {
   @location(1) normal: vec3f,
   @location(2) height: f32,
   @location(3) slope: f32,
+  @location(4) gradientStrength: f32,
 };
 
 @group(0) @binding(0) var<storage, read> samples: array<Sample>;
@@ -217,6 +249,7 @@ fn sample_sky(dirIn: vec3f) -> vec3f {
   sky = mix(sky, top, smoothstep(0.38, 1.0, vertical));
 
   let sunAmount = max(dot(dir, sunDir), 0.0);
+
   sky += vec3f(1.0, 0.88, 0.62) * pow(sunAmount, 4.0) * 0.14;
   sky += vec3f(1.0, 0.92, 0.72) * pow(sunAmount, 56.0) * 1.25;
 
@@ -228,10 +261,12 @@ fn vsMain(@builtin(vertex_index) vertexIndex: u32) -> VertexOut {
   let sample = samples[vertexIndex];
 
   var out: VertexOut;
+
   out.worldPosition = sample.position.xyz;
   out.normal = normalize(sample.normal.xyz);
   out.height = sample.position.w;
   out.slope = length(out.normal.xz);
+  out.gradientStrength = sample.normal.w;
   out.clipPosition = params.viewProjection * vec4f(out.worldPosition, 1.0);
 
   return out;
@@ -250,47 +285,55 @@ fn fsMain(input: VertexOut) -> @location(0) vec4f {
 
   let height = input.height;
   let slope = input.slope;
+  let gradientStrength = input.gradientStrength;
 
   let windAngle = radians(params.windDirection);
   let wind = normalize(vec2f(cos(windAngle), sin(windAngle)));
+  let windSide = vec2f(-wind.y, wind.x);
 
-  let longVariation = fbm(input.worldPosition.xz * 0.012 + wind * params.time * 0.008);
-  let mediumVariation = fbm(input.worldPosition.xz * 0.045 - wind * params.time * 0.022);
+  let alongWind = dot(input.worldPosition.xz, wind);
+  let acrossWind = dot(input.worldPosition.xz, windSide);
+
+  let longVariation = fbm(input.worldPosition.xz * 0.010 + wind * params.time * 0.006);
+  let mediumVariation = fbm(input.worldPosition.xz * 0.038 - wind * params.time * 0.018);
+  let windStreaks = fbm(vec2f(acrossWind * 0.045, alongWind * 0.010 + params.time * 0.018));
   let detailVariation = fbm(input.worldPosition.xz * 0.12 + vec2f(params.time * 0.035, -params.time * 0.018));
 
   let variation =
-    longVariation * 0.52 +
-    mediumVariation * 0.33 +
-    detailVariation * 0.15;
+    longVariation * 0.42 +
+    mediumVariation * 0.28 +
+    windStreaks * 0.22 +
+    detailVariation * 0.08;
 
-  let deepColor = vec3f(0.008, 0.13, 0.18);
-  let midColor = vec3f(0.018, 0.38, 0.48);
-  let shallowColor = vec3f(0.075, 0.75, 0.82);
+  let deepColor = vec3f(0.006, 0.105, 0.155);
+  let midColor = vec3f(0.014, 0.335, 0.435);
+  let shallowColor = vec3f(0.065, 0.68, 0.78);
 
-  var body = mix(deepColor, midColor, smoothstep(-1.25, 0.45, height));
-  body = mix(body, shallowColor, smoothstep(0.15, 1.45, height) * 0.18);
+  var body = mix(deepColor, midColor, smoothstep(-1.45, 0.35, height));
+  body = mix(body, shallowColor, smoothstep(0.12, 1.35, height) * 0.17);
 
   let sunSide = smoothstep(-0.28, 0.82, ndlRaw);
   let shadowSide = 1.0 - sunSide;
 
-  let trough = smoothstep(0.12, 1.15, -height);
-  let crest = smoothstep(0.15, 1.25, height);
-  let steepCrest = smoothstep(0.16, 0.52, slope) * crest;
+  let trough = smoothstep(0.12, 1.20, -height);
+  let crest = smoothstep(0.15, 1.22, height);
+  let steepCrest = smoothstep(0.16, 0.50, slope) * crest;
+  let waveEnergy = smoothstep(0.25, 2.4, gradientStrength);
 
   let bodyDetail = params.bodyDetail;
 
-  body *= mix(1.0, mix(0.68, 1.24, variation), bodyDetail);
-  body *= 1.0 - shadowSide * 0.28;
-  body *= 1.0 - trough * 0.26;
-  body += shallowColor * crest * 0.08;
-  body += shallowColor * sunSide * 0.045;
+  body *= mix(1.0, mix(0.66, 1.24, variation), bodyDetail);
+  body *= 1.0 - shadowSide * 0.27;
+  body *= 1.0 - trough * 0.24;
+  body += shallowColor * crest * 0.07;
+  body += shallowColor * sunSide * 0.044;
 
   let absorption = vec3f(2.18, 1.02, 0.28);
 
-  var opticalDepth = mix(1.1, 8.6, grazing);
-  opticalDepth += trough * 1.3;
-  opticalDepth += shadowSide * 0.85;
-  opticalDepth += (1.0 - variation) * 0.85 * bodyDetail;
+  var opticalDepth = mix(1.08, 8.4, grazing);
+  opticalDepth += trough * 1.24;
+  opticalDepth += shadowSide * 0.82;
+  opticalDepth += (1.0 - variation) * 0.78 * bodyDetail;
 
   let transmittance = exp(-absorption * opticalDepth);
   let scatter = mix(midColor, shallowColor, 0.33);
@@ -299,34 +342,44 @@ fn fsMain(input: VertexOut) -> @location(0) vec4f {
   let R = reflect(-V, N);
   let reflectedSky = sample_sky(R);
 
-  let fresnel = clamp(schlick_fresnel(ndv, 1.333) * 1.25, 0.0, 1.0);
-  let reflectionAmount = clamp(fresnel * 0.88, 0.02, 0.92);
+  let fresnel = clamp(schlick_fresnel(ndv, 1.333) * 1.28, 0.0, 1.0);
+  let reflectionAmount = clamp(fresnel * 0.90, 0.02, 0.94);
 
   let H = normalize(L + V);
   let nh = max(dot(N, H), 0.0);
 
   let glitterNoise = fbm(input.worldPosition.xz * 0.22 + wind * params.time * 0.052);
-  let glitterMask = smoothstep(0.56, 0.94, glitterNoise + slope * 0.22);
+  let glitterMask = smoothstep(0.55, 0.94, glitterNoise + slope * 0.22 + waveEnergy * 0.05);
 
   let spec =
-    pow(nh, 32.0) * 0.055 +
-    pow(nh, 170.0) * 0.50 +
-    pow(nh, 620.0) * 1.85;
+    pow(nh, 30.0) * 0.05 +
+    pow(nh, 160.0) * 0.50 +
+    pow(nh, 620.0) * 1.95;
 
-  let sunSpec = spec * glitterMask * ndl * 2.75;
+  let sunSpec = spec * glitterMask * ndl * 2.85;
 
   var color = mix(transmitted, reflectedSky, reflectionAmount);
   color += vec3f(1.0, 0.90, 0.70) * sunSpec;
 
-  let foamNoise = fbm(input.worldPosition.xz * 0.105 + wind * params.time * 0.03);
-  let foamSource = smoothstep(0.32, 1.18, steepCrest + trough * 0.25 + grazing * 0.16);
-  let foam = smoothstep(0.87, 0.98, foamNoise) * foamSource * params.foamStrength;
+  let foamNoiseA = fbm(vec2f(acrossWind * 0.085, alongWind * 0.018 + params.time * 0.035));
+  let foamNoiseB = fbm(input.worldPosition.xz * 0.105 + wind * params.time * 0.03);
+
+  let foamSource = smoothstep(
+    0.36,
+    1.18,
+    steepCrest + trough * 0.20 + grazing * 0.13 + waveEnergy * 0.15
+  );
+
+  let foam =
+    smoothstep(0.86, 0.98, foamNoiseA * 0.65 + foamNoiseB * 0.35) *
+    foamSource *
+    params.foamStrength;
 
   color = mix(color, vec3f(0.92, 0.98, 1.0), clamp(foam, 0.0, 1.0));
 
   let distanceToCamera = length(params.cameraPos.xyz - input.worldPosition);
-  let fogAmount = smoothstep(310.0, 1050.0, distanceToCamera);
-  color = mix(color, vec3f(0.70, 0.82, 0.88), fogAmount * 0.16);
+  let fogAmount = smoothstep(330.0, 1120.0, distanceToCamera);
+  color = mix(color, vec3f(0.70, 0.82, 0.88), fogAmount * 0.15);
 
   color = color / (color + vec3f(1.0));
   color = pow(color, vec3f(0.88));
@@ -362,16 +415,18 @@ function createSpectrumModes({
   targetStd = 1.0,
 }) {
   const random = mulberry32(1337);
-  const modes = new Float32Array(spectrumSize * spectrumSize * 8);
 
   const g = 9.81;
   const windAngle = THREE.MathUtils.degToRad(windDirection);
   const wind = new THREE.Vector2(Math.cos(windAngle), Math.sin(windAngle));
 
+  const h0 = new Array(spectrumSize * spectrumSize);
+
   const L = Math.max((windSpeed * windSpeed) / g, 0.001);
   const smallWaveDamp = 0.018;
+  const phillipsA = 1.0;
+  const windPower = 6;
 
-  let pointer = 0;
   let amplitudeEnergy = 0;
 
   for (let y = 0; y < spectrumSize; y += 1) {
@@ -384,8 +439,10 @@ function createSpectrumModes({
 
       const kLength = Math.sqrt(kx * kx + kz * kz);
 
-      let amplitude = 0;
+      let real = 0;
+      let imag = 0;
       let directionWeight = 0;
+      let omega = 0;
 
       if (kLength > 0.00001) {
         const kDir = new THREE.Vector2(kx / kLength, kz / kLength);
@@ -394,43 +451,80 @@ function createSpectrumModes({
         const forward = Math.max(alignment, 0);
         const backward = Math.max(-alignment, 0);
 
-        directionWeight = Math.pow(forward, 6) + Math.pow(backward, 2) * 0.04;
+        directionWeight =
+          Math.pow(forward, windPower) +
+          Math.pow(backward, 2) * 0.035;
 
         const phillips =
+          phillipsA *
           (Math.exp(-1 / Math.pow(kLength * L, 2)) /
             Math.pow(kLength, 4)) *
           directionWeight *
           Math.exp(-kLength * kLength * smallWaveDamp * smallWaveDamp);
 
-        const randomEnergy = Math.abs(gaussianRandom(random)) * 0.35 + 0.82;
+        const spectrumAmplitude = Math.sqrt(Math.max(phillips, 0) / 2);
 
-        amplitude = Math.sqrt(Math.max(phillips, 0)) * randomEnergy;
+        real = gaussianRandom(random) * spectrumAmplitude;
+        imag = gaussianRandom(random) * spectrumAmplitude;
+
+        omega = Math.sqrt(g * kLength);
       }
 
-      const phase = random() * Math.PI * 2;
-      const omega = Math.sqrt(g * kLength);
+      const index = y * spectrumSize + x;
 
-      modes[pointer + 0] = kx;
-      modes[pointer + 1] = kz;
-      modes[pointer + 2] = amplitude;
-      modes[pointer + 3] = phase;
+      h0[index] = {
+        kx,
+        kz,
+        real,
+        imag,
+        omega,
+        directionWeight,
+      };
 
-      modes[pointer + 4] = omega;
-      modes[pointer + 5] = directionWeight;
-      modes[pointer + 6] = 0;
-      modes[pointer + 7] = 0;
-
-      amplitudeEnergy += amplitude * amplitude;
-
-      pointer += 8;
+      amplitudeEnergy += real * real + imag * imag;
     }
   }
 
-  const currentStd = Math.sqrt(Math.max(amplitudeEnergy * 0.5, 0.000001));
+  const currentStd = Math.sqrt(Math.max(amplitudeEnergy, 0.000001));
   const normalizeFactor = targetStd / currentStd;
 
-  for (let i = 0; i < modes.length; i += 8) {
-    modes[i + 2] *= normalizeFactor;
+  const modes = new Float32Array(spectrumSize * spectrumSize * 8);
+
+  let pointer = 0;
+
+  for (let y = 0; y < spectrumSize; y += 1) {
+    for (let x = 0; x < spectrumSize; x += 1) {
+      const index = y * spectrumSize + x;
+
+      const xNeg = (spectrumSize - x) % spectrumSize;
+      const yNeg = (spectrumSize - y) % spectrumSize;
+      const negIndex = yNeg * spectrumSize + xNeg;
+
+      const mode = h0[index];
+      const negMode = h0[negIndex];
+
+      const h0Real = mode.real * normalizeFactor;
+      const h0Imag = mode.imag * normalizeFactor;
+
+      /*
+        We store conjugate h0(-k)*.
+        If h0(-k) = a + ib, then conjugate = a - ib.
+      */
+      const h0NegConjReal = negMode.real * normalizeFactor;
+      const h0NegConjImag = -negMode.imag * normalizeFactor;
+
+      modes[pointer + 0] = mode.kx;
+      modes[pointer + 1] = mode.kz;
+      modes[pointer + 2] = h0Real;
+      modes[pointer + 3] = h0Imag;
+
+      modes[pointer + 4] = h0NegConjReal;
+      modes[pointer + 5] = h0NegConjImag;
+      modes[pointer + 6] = mode.omega;
+      modes[pointer + 7] = mode.directionWeight;
+
+      pointer += 8;
+    }
   }
 
   return modes;
@@ -477,11 +571,11 @@ export default function WebGPUFFTProbe() {
   });
 
   const [status, setStatus] = useState(
-    'Initializing WebGPU spectrum foundation...'
+    'Initializing Tessendorf spectrum synthesis...'
   );
 
   const [details, setDetails] = useState(
-    'Preparing spectrum buffer + compute pipeline.'
+    'Preparing h0 + h0(-k) conjugate spectrum buffers.'
   );
 
   useEffect(() => {
@@ -535,7 +629,7 @@ export default function WebGPUFFTProbe() {
         oceanSize: OCEAN_SIZE,
         windSpeed: 18,
         windDirection: 25,
-        targetStd: 0.92,
+        targetStd: 0.95,
       });
 
       const spectrumBuffer = device.createBuffer({
@@ -555,17 +649,17 @@ export default function WebGPUFFTProbe() {
       device.queue.writeBuffer(indexBuffer, 0, indices);
 
       const computeModule = device.createShaderModule({
-        label: 'Ocean spectrum compute shader',
+        label: 'Tessendorf spectrum synthesis compute shader',
         code: computeShader,
       });
 
       const renderModule = device.createShaderModule({
-        label: 'Ocean spectrum render shader',
+        label: 'Tessendorf ocean render shader',
         code: renderShader,
       });
 
       const computePipeline = device.createComputePipeline({
-        label: 'Ocean spectrum compute pipeline',
+        label: 'Tessendorf spectrum synthesis compute pipeline',
         layout: 'auto',
         compute: {
           module: computeModule,
@@ -574,7 +668,7 @@ export default function WebGPUFFTProbe() {
       });
 
       const renderPipeline = device.createRenderPipeline({
-        label: 'Ocean spectrum render pipeline',
+        label: 'Tessendorf ocean render pipeline',
         layout: 'auto',
         vertex: {
           module: renderModule,
@@ -597,7 +691,7 @@ export default function WebGPUFFTProbe() {
       });
 
       const computeBindGroup = device.createBindGroup({
-        label: 'Ocean spectrum compute bind group',
+        label: 'Tessendorf spectrum synthesis compute bind group',
         layout: computePipeline.getBindGroupLayout(0),
         entries: [
           { binding: 0, resource: { buffer: sampleBuffer } },
@@ -607,7 +701,7 @@ export default function WebGPUFFTProbe() {
       });
 
       const renderBindGroup = device.createBindGroup({
-        label: 'Ocean spectrum render bind group',
+        label: 'Tessendorf ocean render bind group',
         layout: renderPipeline.getBindGroupLayout(0),
         entries: [
           { binding: 0, resource: { buffer: sampleBuffer } },
@@ -680,20 +774,20 @@ export default function WebGPUFFTProbe() {
       function writeUniforms(timeSeconds) {
         updateCamera();
 
-        uniformArray[0] = timeSeconds;
+        uniformArray[0] = timeSeconds + 60.0;
         uniformArray[1] = GRID_SIZE;
         uniformArray[2] = OCEAN_SIZE;
         uniformArray[3] = 18.0;
 
         uniformArray[4] = 1.0;
-        uniformArray[5] = 1.15;
-        uniformArray[6] = 0.92;
+        uniformArray[5] = 1.32;
+        uniformArray[6] = 1.05;
         uniformArray[7] = 25.0;
 
         uniformArray[8] = 1.0;
         uniformArray[9] = 1.0;
-        uniformArray[10] = 0.18;
-        uniformArray[11] = 0.85;
+        uniformArray[10] = 0.22;
+        uniformArray[11] = 0.88;
 
         uniformArray[12] = -0.48;
         uniformArray[13] = 0.58;
@@ -720,7 +814,7 @@ export default function WebGPUFFTProbe() {
         const encoder = device.createCommandEncoder();
 
         const computePass = encoder.beginComputePass({
-          label: 'Ocean spectrum compute pass',
+          label: 'Tessendorf spectrum synthesis compute pass',
         });
 
         computePass.setPipeline(computePipeline);
@@ -732,7 +826,7 @@ export default function WebGPUFFTProbe() {
         const depthView = depthTexture.createView();
 
         const renderPass = encoder.beginRenderPass({
-          label: 'Ocean spectrum render pass',
+          label: 'Tessendorf ocean render pass',
           colorAttachments: [
             {
               view: colorView,
@@ -762,15 +856,15 @@ export default function WebGPUFFTProbe() {
 
       frame();
 
-      setStatus('v0.18-B Spectrum Foundation is running.');
+      setStatus('v0.18-C Tessendorf Spectrum Synthesis is running.');
       setDetails(
-        `${GRID_SIZE}x${GRID_SIZE} mesh using ${SPECTRUM_MODE_COUNT} uploaded spectrum modes. Drag to orbit, wheel to zoom.`
+        `${GRID_SIZE}x${GRID_SIZE} mesh using h0(k), h0(-k)*, gradient normals, and choppy displacement. Next: true GPU inverse FFT.`
       );
     }
 
     init().catch((error) => {
       console.error(error);
-      setStatus('WebGPU spectrum foundation failed.');
+      setStatus('WebGPU Tessendorf synthesis failed.');
       setDetails(error?.message || 'Unknown WebGPU error.');
     });
 
@@ -874,7 +968,7 @@ export default function WebGPUFFTProbe() {
           position: 'absolute',
           left: 28,
           bottom: 28,
-          width: 'min(650px, calc(100vw - 56px))',
+          width: 'min(680px, calc(100vw - 56px))',
           padding: '18px 20px',
           borderRadius: 18,
           border: '1px solid rgba(160, 230, 255, 0.25)',
@@ -897,7 +991,7 @@ export default function WebGPUFFTProbe() {
             color: 'rgba(205, 244, 255, 0.9)',
           }}
         >
-          OceanShader Pro / v0.18-B
+          OceanShader Pro / v0.18-C
         </p>
 
         <h1
@@ -908,7 +1002,7 @@ export default function WebGPUFFTProbe() {
             letterSpacing: '-0.055em',
           }}
         >
-          Spectrum Foundation
+          Tessendorf Spectrum Synthesis
         </h1>
 
         <p
