@@ -1,8 +1,8 @@
 import React from 'react';
 import { Leva } from 'leva';
-import OceanScene from './ocean/ocean-scene.jsx';
-import WebGPUProbe from './ocean/webgpu-probe.jsx';
-import WebGPUFFTProbe from './ocean/webgpu-fft-probe.jsx';
+import OceanScene from './ocean/legacy/ocean-scene.jsx';
+import WebGPUProbe from './ocean/webgpu/webgpu-probe.jsx';
+import WebGPUFFTProbe from './ocean/webgpu/webgpu-fft-probe.jsx';
 
 export default function App() {
   const params = new URLSearchParams(window.location.search);
