@@ -7,10 +7,19 @@ import {
   DEFAULT_OCEAN_SETTINGS,
 } from '../engine/settings/ocean-settings.js';
 import { createSpectrumModes } from '../engine/utils/spectrum.js';
+import { createGridIndices } from '../engine/utils/grid.js';
+import {
+  createAndUploadStorageBuffer,
+  createFFTParamBuffer,
+  createIndexBuffer,
+  createStorageBuffer,
+  createUniformBuffer,
+} from '../engine/buffers/gpu-buffers.js';
 
 const SETTINGS = DEFAULT_OCEAN_SETTINGS;
+const FIELD_NAMES = ['height', 'gradientX', 'gradientZ', 'displacementX', 'displacementZ'];
 
-const computeSpectrumShader = /* wgsl */ `
+const spectrumFieldsShader = /* wgsl */ `
 struct SpectrumMode {
   data0: vec4f,
   data1: vec4f,
@@ -37,9 +46,13 @@ struct Params {
   viewProjection: mat4x4f,
 };
 
-@group(0) @binding(0) var<storage, read_write> spectrumOut: array<vec4f>;
-@group(0) @binding(1) var<uniform> params: Params;
-@group(0) @binding(2) var<storage, read> modes: array<SpectrumMode>;
+@group(0) @binding(0) var<storage, read_write> heightSpectrumOut: array<vec4f>;
+@group(0) @binding(1) var<storage, read_write> gradientXSpectrumOut: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> gradientZSpectrumOut: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> displacementXSpectrumOut: array<vec4f>;
+@group(0) @binding(4) var<storage, read_write> displacementZSpectrumOut: array<vec4f>;
+@group(0) @binding(5) var<uniform> params: Params;
+@group(0) @binding(6) var<storage, read> modes: array<SpectrumMode>;
 
 const FFT_SIZE_U: u32 = ${FFT_SIZE}u;
 const FFT_LOG_SIZE_U: u32 = ${FFT_LOG_SIZE}u;
@@ -49,6 +62,14 @@ fn complex_mul(a: vec2f, b: vec2f) -> vec2f {
     a.x * b.x - a.y * b.y,
     a.x * b.y + a.y * b.x
   );
+}
+
+fn complex_mul_i_scale(value: vec2f, scale: f32) -> vec2f {
+  return vec2f(-value.y * scale, value.x * scale);
+}
+
+fn complex_mul_negative_i_scale(value: vec2f, scale: f32) -> vec2f {
+  return vec2f(value.y * scale, -value.x * scale);
 }
 
 fn bit_reverse(v: u32) -> u32 {
@@ -77,6 +98,7 @@ fn csMain(@builtin(global_invocation_id) globalId: vec3u) {
 
   let mode = modes[id];
 
+  let k = mode.data0.xy;
   let h0 = mode.data0.zw;
   let h0NegConj = mode.data1.xy;
   let omega = mode.data1.z;
@@ -92,12 +114,33 @@ fn csMain(@builtin(global_invocation_id) globalId: vec3u) {
   let directionalLift = mix(0.72, 1.18, clamp(directionWeight, 0.0, 1.0));
   hkt *= directionalLift;
 
+  let kLength = max(length(k), 0.0001);
+  let kDir = k / kLength;
+
+  /*
+    Strict Tessendorf fields:
+    height: h(k,t)
+    gradient X: i * kx * h(k,t)
+    gradient Z: i * kz * h(k,t)
+    displacement X: -i * kx/|k| * h(k,t)
+    displacement Z: -i * kz/|k| * h(k,t)
+  */
+  let heightSpectrum = hkt;
+  let gradientXSpectrum = complex_mul_i_scale(hkt, k.x);
+  let gradientZSpectrum = complex_mul_i_scale(hkt, k.y);
+  let displacementXSpectrum = complex_mul_negative_i_scale(hkt, kDir.x);
+  let displacementZSpectrum = complex_mul_negative_i_scale(hkt, kDir.y);
+
   let rx = bit_reverse(x);
   let ry = bit_reverse(y);
 
   let outIndex = ry * FFT_SIZE_U + rx;
 
-  spectrumOut[outIndex] = vec4f(hkt, 0.0, 0.0);
+  heightSpectrumOut[outIndex] = vec4f(heightSpectrum, 0.0, 0.0);
+  gradientXSpectrumOut[outIndex] = vec4f(gradientXSpectrum, 0.0, 0.0);
+  gradientZSpectrumOut[outIndex] = vec4f(gradientZSpectrum, 0.0, 0.0);
+  displacementXSpectrumOut[outIndex] = vec4f(displacementXSpectrum, 0.0, 0.0);
+  displacementZSpectrumOut[outIndex] = vec4f(displacementZSpectrum, 0.0, 0.0);
 }
 `;
 
@@ -198,23 +241,13 @@ struct Params {
   viewProjection: mat4x4f,
 };
 
-@group(0) @binding(0) var<storage, read> fftValues: array<vec4f>;
-@group(0) @binding(1) var<storage, read_write> samples: array<Sample>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-fn safe_index(x: i32, y: i32) -> u32 {
-  let n = i32(params.gridSize);
-
-  let xx = clamp(x, 0, n - 1);
-  let yy = clamp(y, 0, n - 1);
-
-  return u32(yy * n + xx);
-}
-
-fn height_at(x: i32, y: i32) -> f32 {
-  let raw = fftValues[safe_index(x, y)].x;
-  return raw * params.waveHeight * params.spectrumStrength;
-}
+@group(0) @binding(0) var<storage, read> heightValues: array<vec4f>;
+@group(0) @binding(1) var<storage, read> gradientXValues: array<vec4f>;
+@group(0) @binding(2) var<storage, read> gradientZValues: array<vec4f>;
+@group(0) @binding(3) var<storage, read> displacementXValues: array<vec4f>;
+@group(0) @binding(4) var<storage, read> displacementZValues: array<vec4f>;
+@group(0) @binding(5) var<storage, read_write> samples: array<Sample>;
+@group(0) @binding(6) var<uniform> params: Params;
 
 @compute @workgroup_size(256)
 fn csMain(@builtin(global_invocation_id) globalId: vec3u) {
@@ -229,50 +262,41 @@ fn csMain(@builtin(global_invocation_id) globalId: vec3u) {
   let x = id % n;
   let y = id / n;
 
-  let xi = i32(x);
-  let yi = i32(y);
-
   let fx = f32(x) / f32(n - 1u) - 0.5;
   let fy = f32(y) / f32(n - 1u) - 0.5;
 
-  let spacing = params.oceanSize / f32(n - 1u);
+  let checker = select(-1.0, 1.0, ((x + y) & 1u) == 0u);
 
-  let h = height_at(xi, yi);
+  let heightScale = params.waveHeight * params.spectrumStrength;
+  let chopScale = params.choppiness * params.waveHeight * params.spectrumStrength;
 
-  let hL = height_at(xi - 1, yi);
-  let hR = height_at(xi + 1, yi);
-  let hD = height_at(xi, yi - 1);
-  let hU = height_at(xi, yi + 1);
+  let height = heightValues[id].x * checker * heightScale;
 
-  let gradX = (hR - hL) / (2.0 * spacing);
-  let gradZ = (hU - hD) / (2.0 * spacing);
+  let gradientX = gradientXValues[id].x * checker * heightScale;
+  let gradientZ = gradientZValues[id].x * checker * heightScale;
 
-  let normal = normalize(vec3f(
-    -gradX,
-    1.0,
-    -gradZ
-  ));
-
-  let chopScale = params.choppiness * 5.5;
-
-  let chop = vec2f(
-    -gradX,
-    -gradZ
-  ) * chopScale;
+  let displacementX = displacementXValues[id].x * checker * chopScale;
+  let displacementZ = displacementZValues[id].x * checker * chopScale;
 
   let baseX = fx * params.oceanSize;
   let baseZ = fy * params.oceanSize;
 
+  let normal = normalize(vec3f(
+    -gradientX,
+    1.0,
+    -gradientZ
+  ));
+
   samples[id].position = vec4f(
-    baseX + chop.x,
-    h,
-    baseZ + chop.y,
-    h
+    baseX + displacementX,
+    height,
+    baseZ + displacementZ,
+    height
   );
 
   samples[id].normal = vec4f(
     normal,
-    length(vec2f(gradX, gradZ))
+    length(vec2f(gradientX, gradientZ))
   );
 }
 `;
@@ -360,17 +384,17 @@ fn sample_sky(dirIn: vec3f) -> vec3f {
 
   let vertical = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
 
-  let horizon = vec3f(0.82, 0.88, 0.90);
-  let mid = vec3f(0.45, 0.68, 0.82);
-  let top = vec3f(0.23, 0.42, 0.62);
+  let horizon = vec3f(0.78, 0.86, 0.90);
+  let mid = vec3f(0.38, 0.60, 0.75);
+  let top = vec3f(0.18, 0.34, 0.52);
 
   var sky = mix(horizon, mid, smoothstep(0.0, 0.55, vertical));
   sky = mix(sky, top, smoothstep(0.38, 1.0, vertical));
 
   let sunAmount = max(dot(dir, sunDir), 0.0);
 
-  sky += vec3f(1.0, 0.88, 0.62) * pow(sunAmount, 4.0) * 0.14;
-  sky += vec3f(1.0, 0.92, 0.72) * pow(sunAmount, 56.0) * 1.25;
+  sky += vec3f(1.0, 0.86, 0.58) * pow(sunAmount, 5.0) * 0.06;
+  sky += vec3f(1.0, 0.94, 0.76) * pow(sunAmount, 96.0) * 1.65;
 
   return sky;
 }
@@ -397,14 +421,14 @@ fn fsMain(input: VertexOut) -> @location(0) vec4f {
   let V = normalize(params.cameraPos.xyz - input.worldPosition);
   let L = normalize(params.sunDir.xyz);
 
+  let height = input.height;
+  let slope = input.slope;
+  let gradientStrength = input.gradientStrength;
+
   let ndv = clamp(dot(N, V), 0.0, 1.0);
   let ndlRaw = dot(N, L);
   let ndl = clamp(ndlRaw, 0.0, 1.0);
   let grazing = 1.0 - ndv;
-
-  let height = input.height;
-  let slope = input.slope;
-  let gradientStrength = input.gradientStrength;
 
   let windAngle = radians(params.windDirection);
   let wind = normalize(vec2f(cos(windAngle), sin(windAngle)));
@@ -414,136 +438,179 @@ fn fsMain(input: VertexOut) -> @location(0) vec4f {
   let acrossWind = dot(input.worldPosition.xz, windSide);
 
   let longVariation = fbm(input.worldPosition.xz * 0.010 + wind * params.time * 0.006);
-  let mediumVariation = fbm(input.worldPosition.xz * 0.038 - wind * params.time * 0.018);
+  let mediumVariation = fbm(input.worldPosition.xz * 0.035 - wind * params.time * 0.016);
   let windStreaks = fbm(vec2f(acrossWind * 0.045, alongWind * 0.010 + params.time * 0.018));
-  let detailVariation = fbm(input.worldPosition.xz * 0.12 + vec2f(params.time * 0.035, -params.time * 0.018));
 
   let variation =
     longVariation * 0.42 +
-    mediumVariation * 0.28 +
-    windStreaks * 0.22 +
-    detailVariation * 0.08;
+    mediumVariation * 0.30 +
+    windStreaks * 0.28;
 
-  let deepColor = vec3f(0.006, 0.105, 0.155);
-  let midColor = vec3f(0.014, 0.335, 0.435);
-  let shallowColor = vec3f(0.065, 0.68, 0.78);
+  let waveEnergy = smoothstep(0.08, 1.65, gradientStrength);
 
-  var body = mix(deepColor, midColor, smoothstep(-1.45, 0.35, height));
-  body = mix(body, shallowColor, smoothstep(0.12, 1.35, height) * 0.17);
+  let deepColor = vec3f(0.0025, 0.060, 0.092);
+  let midColor = vec3f(0.008, 0.230, 0.320);
+  let shallowColor = vec3f(0.042, 0.48, 0.58);
 
-  let sunSide = smoothstep(-0.28, 0.82, ndlRaw);
+  var body = mix(deepColor, midColor, smoothstep(-1.50, 0.30, height));
+  body = mix(body, shallowColor, smoothstep(0.20, 1.40, height) * 0.10);
+
+  let sunSide = smoothstep(-0.35, 0.82, ndlRaw);
   let shadowSide = 1.0 - sunSide;
 
   let trough = smoothstep(0.12, 1.20, -height);
   let crest = smoothstep(0.15, 1.22, height);
-  let steepCrest = smoothstep(0.16, 0.50, slope) * crest;
-  let waveEnergy = smoothstep(0.10, 1.2, gradientStrength);
+  let steepCrest = smoothstep(0.20, 0.58, slope) * crest;
 
-  let bodyDetail = params.bodyDetail;
+  body *= mix(1.0, mix(0.70, 1.08, variation), params.bodyDetail);
+  body *= 1.0 - shadowSide * 0.30;
+  body *= 1.0 - trough * 0.26;
+  body += shallowColor * crest * 0.035;
+  body += shallowColor * sunSide * 0.018;
 
-  body *= mix(1.0, mix(0.66, 1.24, variation), bodyDetail);
-  body *= 1.0 - shadowSide * 0.27;
-  body *= 1.0 - trough * 0.24;
-  body += shallowColor * crest * 0.07;
-  body += shallowColor * sunSide * 0.044;
+  let absorption = vec3f(2.40, 1.16, 0.32);
 
-  let absorption = vec3f(2.18, 1.02, 0.28);
-
-  var opticalDepth = mix(1.08, 8.4, grazing);
-  opticalDepth += trough * 1.24;
-  opticalDepth += shadowSide * 0.82;
-  opticalDepth += (1.0 - variation) * 0.78 * bodyDetail;
+  var opticalDepth = mix(1.20, 9.8, grazing);
+  opticalDepth += trough * 1.35;
+  opticalDepth += shadowSide * 0.95;
+  opticalDepth += (1.0 - variation) * 0.82 * params.bodyDetail;
 
   let transmittance = exp(-absorption * opticalDepth);
-  let scatter = mix(midColor, shallowColor, 0.33);
-  let transmitted = body * transmittance + scatter * (1.0 - transmittance) * 0.52;
+  let scatter = mix(midColor, shallowColor, 0.20);
+  let transmitted = body * transmittance + scatter * (1.0 - transmittance) * 0.38;
 
   let R = reflect(-V, N);
   let reflectedSky = sample_sky(R);
 
-  let fresnel = clamp(schlick_fresnel(ndv, 1.333) * 1.28, 0.0, 1.0);
-  let reflectionAmount = clamp(fresnel * 0.90, 0.02, 0.94);
+  let fresnel = clamp(schlick_fresnel(ndv, 1.333) * 1.50, 0.0, 1.0);
+  let reflectionAmount = clamp(fresnel * 1.04 + waveEnergy * 0.025, 0.03, 0.94);
 
-  let H = normalize(L + V);
-  let nh = max(dot(N, H), 0.0);
+  let sunReflect = max(dot(reflect(-L, N), V), 0.0);
 
-  let glitterNoise = fbm(input.worldPosition.xz * 0.22 + wind * params.time * 0.052);
-  let glitterMask = smoothstep(0.55, 0.94, glitterNoise + slope * 0.22 + waveEnergy * 0.05);
+  let glintNoiseFine = fbm(input.worldPosition.xz * 1.65 + wind * params.time * 0.20);
+  let glintNoiseNeedle = fbm(vec2f(acrossWind * 0.30, alongWind * 0.055 + params.time * 0.12));
+  let glintNoiseSpark = noise(input.worldPosition.xz * 2.75 + windSide * params.time * 0.28);
 
-  let spec =
-    pow(nh, 30.0) * 0.05 +
-    pow(nh, 160.0) * 0.50 +
-    pow(nh, 620.0) * 1.95;
+  let tinyGlintMask = smoothstep(
+    0.82,
+    0.995,
+    glintNoiseFine * 0.42 +
+      glintNoiseNeedle * 0.42 +
+      glintNoiseSpark * 0.16 +
+      slope * 0.08 +
+      waveEnergy * 0.05
+  );
 
-  let sunSpec = spec * glitterMask * ndl * 2.85;
+  let directionalStretch = smoothstep(
+    0.20,
+    1.0,
+    dot(normalize(vec2f(N.x, N.z) + vec2f(0.0001, 0.0001)), wind) * 0.5 + 0.5
+  );
 
-  var color = mix(transmitted, reflectedSky, reflectionAmount);
-  color += vec3f(1.0, 0.90, 0.70) * sunSpec;
+  let wideSpec = pow(sunReflect, 64.0) * 0.08;
+  let tightSpec = pow(sunReflect, 260.0) * 0.72;
+  let razorSpec = pow(sunReflect, 980.0) * 3.15;
 
-  let foamNoiseA = fbm(vec2f(acrossWind * 0.085, alongWind * 0.018 + params.time * 0.035));
-  let foamNoiseB = fbm(input.worldPosition.xz * 0.105 + wind * params.time * 0.03);
+  let sunGlint =
+    (wideSpec + tightSpec + razorSpec) *
+    tinyGlintMask *
+    mix(0.42, 1.0, directionalStretch) *
+    mix(0.50, 1.20, waveEnergy) *
+    max(ndl, 0.0);
 
-  let foamSource = smoothstep(
-    0.34,
-    1.12,
-    steepCrest + trough * 0.18 + grazing * 0.12 + waveEnergy * 0.20
+  var color = mix(transmitted * 0.84, reflectedSky * 0.58, reflectionAmount);
+
+  color *= mix(0.76, 1.0, grazing);
+  color += vec3f(1.0, 0.96, 0.84) * sunGlint;
+
+  let foamLineNoise = fbm(vec2f(acrossWind * 0.18, alongWind * 0.035 + params.time * 0.050));
+  let foamFineNoise = noise(input.worldPosition.xz * 1.15 + wind * params.time * 0.08);
+
+  let crestOnlyFoamSource = smoothstep(
+    0.42,
+    1.14,
+    steepCrest + waveEnergy * 0.26 + crest * 0.20
   );
 
   let foam =
-    smoothstep(0.86, 0.98, foamNoiseA * 0.65 + foamNoiseB * 0.35) *
-    foamSource *
-    params.foamStrength;
+    smoothstep(0.88, 0.99, foamLineNoise * 0.62 + foamFineNoise * 0.38) *
+    crestOnlyFoamSource *
+    params.foamStrength *
+    0.42;
 
-  color = mix(color, vec3f(0.92, 0.98, 1.0), clamp(foam, 0.0, 1.0));
+  color = mix(color, vec3f(0.88, 0.96, 1.0), clamp(foam, 0.0, 1.0));
 
   let distanceToCamera = length(params.cameraPos.xyz - input.worldPosition);
-  let fogAmount = smoothstep(340.0, 1180.0, distanceToCamera);
-  color = mix(color, vec3f(0.70, 0.82, 0.88), fogAmount * 0.15);
+  let fogAmount = smoothstep(460.0, 1380.0, distanceToCamera);
+  color = mix(color, vec3f(0.64, 0.76, 0.82), fogAmount * 0.08);
 
   color = color / (color + vec3f(1.0));
-  color = pow(color, vec3f(0.88));
+  color = pow(color, vec3f(0.84));
 
   return vec4f(color, 1.0);
 }
 `;
 
-function createGridIndices(size) {
-  const cells = size - 1;
-  const indices = new Uint32Array(cells * cells * 6);
+function createFFTFieldBuffers(device, complexBufferSize) {
+  const fields = {};
 
-  let pointer = 0;
+  for (const fieldName of FIELD_NAMES) {
+    fields[fieldName] = {
+      a: createStorageBuffer(device, complexBufferSize, `${fieldName} FFT Buffer A`),
+      b: createStorageBuffer(device, complexBufferSize, `${fieldName} FFT Buffer B`),
+    };
+  }
 
-  for (let z = 0; z < cells; z += 1) {
-    for (let x = 0; x < cells; x += 1) {
-      const a = z * size + x;
-      const b = a + 1;
-      const c = a + size;
-      const d = c + 1;
+  return fields;
+}
 
-      indices[pointer++] = a;
-      indices[pointer++] = c;
-      indices[pointer++] = b;
+function createFieldFFTBindGroups(device, fftLayout, fields) {
+  const rowBindGroups = {};
+  const columnBindGroups = {};
 
-      indices[pointer++] = b;
-      indices[pointer++] = c;
-      indices[pointer++] = d;
+  for (const fieldName of FIELD_NAMES) {
+    rowBindGroups[fieldName] = [];
+    columnBindGroups[fieldName] = [];
+
+    const field = fields[fieldName];
+
+    for (let stage = 0; stage < FFT_LOG_SIZE; stage += 1) {
+      const rowParamBuffer = createFFTParamBuffer(device, stage, 0, FFT_SIZE);
+      const columnParamBuffer = createFFTParamBuffer(device, stage, 1, FFT_SIZE);
+
+      const rowInput = stage % 2 === 0 ? field.a : field.b;
+      const rowOutput = stage % 2 === 0 ? field.b : field.a;
+
+      rowBindGroups[fieldName].push(
+        device.createBindGroup({
+          label: `${fieldName} horizontal FFT stage ${stage}`,
+          layout: fftLayout,
+          entries: [
+            { binding: 0, resource: { buffer: rowInput } },
+            { binding: 1, resource: { buffer: rowOutput } },
+            { binding: 2, resource: { buffer: rowParamBuffer } },
+          ],
+        })
+      );
+
+      const columnInput = stage % 2 === 0 ? field.b : field.a;
+      const columnOutput = stage % 2 === 0 ? field.a : field.b;
+
+      columnBindGroups[fieldName].push(
+        device.createBindGroup({
+          label: `${fieldName} vertical FFT stage ${stage}`,
+          layout: fftLayout,
+          entries: [
+            { binding: 0, resource: { buffer: columnInput } },
+            { binding: 1, resource: { buffer: columnOutput } },
+            { binding: 2, resource: { buffer: columnParamBuffer } },
+          ],
+        })
+      );
     }
   }
 
-  return indices;
-}
-
-function createFFTParamBuffer(device, stage, direction, size) {
-  const values = new Uint32Array([stage, direction, size, 0]);
-
-  const buffer = device.createBuffer({
-    size: values.byteLength,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
-
-  device.queue.writeBuffer(buffer, 0, values);
-
-  return buffer;
+  return { rowBindGroups, columnBindGroups };
 }
 
 export default function WebGPUFFTProbe() {
@@ -561,11 +628,11 @@ export default function WebGPUFFTProbe() {
   });
 
   const [status, setStatus] = useState(
-    'Initializing modular GPU IFFT foundation...'
+    'Initializing strict Tessendorf IFFT pipeline...'
   );
 
   const [details, setDetails] = useState(
-    'Using shared engine settings and reusable spectrum generation.'
+    'Computing height, gradients, and horizontal displacements as separate IFFT fields.'
   );
 
   useEffect(() => {
@@ -580,7 +647,7 @@ export default function WebGPUFFTProbe() {
 
       if (!navigator.gpu) {
         setStatus('Native WebGPU was not detected.');
-        setDetails('This probe needs native navigator.gpu, not WebGL fallback.');
+        setDetails('This route needs native navigator.gpu, not WebGL fallback.');
         return;
       }
 
@@ -605,25 +672,19 @@ export default function WebGPUFFTProbe() {
       const complexBufferSize = vertexCount * 4 * 4;
       const sampleBufferSize = vertexCount * 8 * 4;
 
-      const fftBufferA = device.createBuffer({
-        size: complexBufferSize,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      });
+      const fftFields = createFFTFieldBuffers(device, complexBufferSize);
 
-      const fftBufferB = device.createBuffer({
-        size: complexBufferSize,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      });
+      const sampleBuffer = createStorageBuffer(
+        device,
+        sampleBufferSize,
+        'Strict Tessendorf Ocean Sample Buffer'
+      );
 
-      const sampleBuffer = device.createBuffer({
-        size: sampleBufferSize,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      });
-
-      const uniformBuffer = device.createBuffer({
-        size: 36 * 4,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      });
+      const uniformBuffer = createUniformBuffer(
+        device,
+        36 * 4,
+        'Strict Tessendorf Ocean Uniform Buffer'
+      );
 
       const spectrumModes = createSpectrumModes({
         size: FFT_SIZE,
@@ -638,44 +699,37 @@ export default function WebGPUFFTProbe() {
         smallWaveDamp: SETTINGS.spectrum.smallWaveDamp,
       });
 
-      const spectrumBuffer = device.createBuffer({
-        size: spectrumModes.byteLength,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      });
-
-      device.queue.writeBuffer(spectrumBuffer, 0, spectrumModes);
+      const spectrumBuffer = createAndUploadStorageBuffer(
+        device,
+        spectrumModes,
+        'Strict Tessendorf Spectrum Buffer'
+      );
 
       const indices = createGridIndices(FFT_SIZE);
-
-      const indexBuffer = device.createBuffer({
-        size: indices.byteLength,
-        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
-      });
-
-      device.queue.writeBuffer(indexBuffer, 0, indices);
+      const indexBuffer = createIndexBuffer(device, indices, 'Strict Tessendorf Index Buffer');
 
       const spectrumModule = device.createShaderModule({
-        label: 'GPU IFFT spectrum shader',
-        code: computeSpectrumShader,
+        label: 'Strict Tessendorf spectrum fields shader',
+        code: spectrumFieldsShader,
       });
 
       const fftModule = device.createShaderModule({
-        label: 'GPU IFFT Stockham shader',
+        label: 'Strict Tessendorf FFT shader',
         code: fftShader,
       });
 
       const sampleModule = device.createShaderModule({
-        label: 'GPU IFFT sample shader',
+        label: 'Strict Tessendorf sample shader',
         code: sampleShader,
       });
 
       const renderModule = device.createShaderModule({
-        label: 'GPU IFFT render shader',
+        label: 'Strict Tessendorf render shader',
         code: renderShader,
       });
 
       const spectrumPipeline = device.createComputePipeline({
-        label: 'GPU IFFT spectrum pipeline',
+        label: 'Strict Tessendorf spectrum fields pipeline',
         layout: 'auto',
         compute: {
           module: spectrumModule,
@@ -684,7 +738,7 @@ export default function WebGPUFFTProbe() {
       });
 
       const fftPipeline = device.createComputePipeline({
-        label: 'GPU IFFT Stockham pipeline',
+        label: 'Strict Tessendorf FFT pipeline',
         layout: 'auto',
         compute: {
           module: fftModule,
@@ -693,7 +747,7 @@ export default function WebGPUFFTProbe() {
       });
 
       const samplePipeline = device.createComputePipeline({
-        label: 'GPU IFFT sample pipeline',
+        label: 'Strict Tessendorf sample pipeline',
         layout: 'auto',
         compute: {
           module: sampleModule,
@@ -702,7 +756,7 @@ export default function WebGPUFFTProbe() {
       });
 
       const renderPipeline = device.createRenderPipeline({
-        label: 'GPU IFFT render pipeline',
+        label: 'Strict Tessendorf render pipeline',
         layout: 'auto',
         vertex: {
           module: renderModule,
@@ -725,67 +779,42 @@ export default function WebGPUFFTProbe() {
       });
 
       const spectrumBindGroup = device.createBindGroup({
-        label: 'GPU IFFT spectrum bind group',
+        label: 'Strict Tessendorf spectrum fields bind group',
         layout: spectrumPipeline.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: { buffer: fftBufferA } },
-          { binding: 1, resource: { buffer: uniformBuffer } },
-          { binding: 2, resource: { buffer: spectrumBuffer } },
+          { binding: 0, resource: { buffer: fftFields.height.a } },
+          { binding: 1, resource: { buffer: fftFields.gradientX.a } },
+          { binding: 2, resource: { buffer: fftFields.gradientZ.a } },
+          { binding: 3, resource: { buffer: fftFields.displacementX.a } },
+          { binding: 4, resource: { buffer: fftFields.displacementZ.a } },
+          { binding: 5, resource: { buffer: uniformBuffer } },
+          { binding: 6, resource: { buffer: spectrumBuffer } },
         ],
       });
 
       const fftLayout = fftPipeline.getBindGroupLayout(0);
-
-      const rowBindGroups = [];
-      const columnBindGroups = [];
-
-      for (let stage = 0; stage < FFT_LOG_SIZE; stage += 1) {
-        const rowParamBuffer = createFFTParamBuffer(device, stage, 0, FFT_SIZE);
-        const columnParamBuffer = createFFTParamBuffer(device, stage, 1, FFT_SIZE);
-
-        const rowInput = stage % 2 === 0 ? fftBufferA : fftBufferB;
-        const rowOutput = stage % 2 === 0 ? fftBufferB : fftBufferA;
-
-        rowBindGroups.push(
-          device.createBindGroup({
-            label: `GPU IFFT row stage ${stage}`,
-            layout: fftLayout,
-            entries: [
-              { binding: 0, resource: { buffer: rowInput } },
-              { binding: 1, resource: { buffer: rowOutput } },
-              { binding: 2, resource: { buffer: rowParamBuffer } },
-            ],
-          })
-        );
-
-        const columnInput = stage % 2 === 0 ? fftBufferB : fftBufferA;
-        const columnOutput = stage % 2 === 0 ? fftBufferA : fftBufferB;
-
-        columnBindGroups.push(
-          device.createBindGroup({
-            label: `GPU IFFT column stage ${stage}`,
-            layout: fftLayout,
-            entries: [
-              { binding: 0, resource: { buffer: columnInput } },
-              { binding: 1, resource: { buffer: columnOutput } },
-              { binding: 2, resource: { buffer: columnParamBuffer } },
-            ],
-          })
-        );
-      }
+      const { rowBindGroups, columnBindGroups } = createFieldFFTBindGroups(
+        device,
+        fftLayout,
+        fftFields
+      );
 
       const sampleBindGroup = device.createBindGroup({
-        label: 'GPU IFFT sample bind group',
+        label: 'Strict Tessendorf sample bind group',
         layout: samplePipeline.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: { buffer: fftBufferA } },
-          { binding: 1, resource: { buffer: sampleBuffer } },
-          { binding: 2, resource: { buffer: uniformBuffer } },
+          { binding: 0, resource: { buffer: fftFields.height.a } },
+          { binding: 1, resource: { buffer: fftFields.gradientX.a } },
+          { binding: 2, resource: { buffer: fftFields.gradientZ.a } },
+          { binding: 3, resource: { buffer: fftFields.displacementX.a } },
+          { binding: 4, resource: { buffer: fftFields.displacementZ.a } },
+          { binding: 5, resource: { buffer: sampleBuffer } },
+          { binding: 6, resource: { buffer: uniformBuffer } },
         ],
       });
 
       const renderBindGroup = device.createBindGroup({
-        label: 'GPU IFFT render bind group',
+        label: 'Strict Tessendorf render bind group',
         layout: renderPipeline.getBindGroupLayout(0),
         entries: [
           { binding: 0, resource: { buffer: sampleBuffer } },
@@ -913,7 +942,7 @@ export default function WebGPUFFTProbe() {
         const encoder = device.createCommandEncoder();
 
         const spectrumPass = encoder.beginComputePass({
-          label: 'GPU IFFT h(k,t) spectrum pass',
+          label: 'Strict Tessendorf h(k,t) fields pass',
         });
 
         spectrumPass.setPipeline(spectrumPipeline);
@@ -921,30 +950,32 @@ export default function WebGPUFFTProbe() {
         spectrumPass.dispatchWorkgroups(Math.ceil(vertexCount / 256));
         spectrumPass.end();
 
-        for (let stage = 0; stage < FFT_LOG_SIZE; stage += 1) {
-          const rowPass = encoder.beginComputePass({
-            label: `GPU IFFT horizontal stage ${stage}`,
-          });
+        for (const fieldName of FIELD_NAMES) {
+          for (let stage = 0; stage < FFT_LOG_SIZE; stage += 1) {
+            const rowPass = encoder.beginComputePass({
+              label: `${fieldName} horizontal IFFT stage ${stage}`,
+            });
 
-          rowPass.setPipeline(fftPipeline);
-          rowPass.setBindGroup(0, rowBindGroups[stage]);
-          rowPass.dispatchWorkgroups(Math.ceil(vertexCount / 2 / 256));
-          rowPass.end();
-        }
+            rowPass.setPipeline(fftPipeline);
+            rowPass.setBindGroup(0, rowBindGroups[fieldName][stage]);
+            rowPass.dispatchWorkgroups(Math.ceil(vertexCount / 2 / 256));
+            rowPass.end();
+          }
 
-        for (let stage = 0; stage < FFT_LOG_SIZE; stage += 1) {
-          const columnPass = encoder.beginComputePass({
-            label: `GPU IFFT vertical stage ${stage}`,
-          });
+          for (let stage = 0; stage < FFT_LOG_SIZE; stage += 1) {
+            const columnPass = encoder.beginComputePass({
+              label: `${fieldName} vertical IFFT stage ${stage}`,
+            });
 
-          columnPass.setPipeline(fftPipeline);
-          columnPass.setBindGroup(0, columnBindGroups[stage]);
-          columnPass.dispatchWorkgroups(Math.ceil(vertexCount / 2 / 256));
-          columnPass.end();
+            columnPass.setPipeline(fftPipeline);
+            columnPass.setBindGroup(0, columnBindGroups[fieldName][stage]);
+            columnPass.dispatchWorkgroups(Math.ceil(vertexCount / 2 / 256));
+            columnPass.end();
+          }
         }
 
         const samplePass = encoder.beginComputePass({
-          label: 'GPU IFFT displacement sample pass',
+          label: 'Strict Tessendorf displacement + normal sample pass',
         });
 
         samplePass.setPipeline(samplePipeline);
@@ -958,7 +989,7 @@ export default function WebGPUFFTProbe() {
         const clear = SETTINGS.renderer.clearColor;
 
         const renderPass = encoder.beginRenderPass({
-          label: 'GPU IFFT ocean render pass',
+          label: 'Strict Tessendorf ocean render pass',
           colorAttachments: [
             {
               view: colorView,
@@ -993,15 +1024,15 @@ export default function WebGPUFFTProbe() {
 
       frame();
 
-      setStatus('v0.18.6 Modular GPU IFFT Foundation is running.');
+      setStatus('v0.19.0 Strict Tessendorf IFFT Pipeline is running.');
       setDetails(
-        `${FFT_SIZE}x${FFT_SIZE} FFT route now uses shared engine settings + reusable spectrum generation. Next: extract buffers and shader modules.`
+        `${FFT_SIZE}x${FFT_SIZE} fields: height, gradient X/Z, and displacement X/Z are generated in frequency space, IFFT processed, then used for vertex height, normals, and chop.`
       );
     }
 
     init().catch((error) => {
       console.error(error);
-      setStatus('WebGPU modular GPU IFFT foundation failed.');
+      setStatus('WebGPU strict Tessendorf IFFT pipeline failed.');
       setDetails(error?.message || 'Unknown WebGPU error.');
     });
 
@@ -1105,7 +1136,7 @@ export default function WebGPUFFTProbe() {
           position: 'absolute',
           left: 28,
           bottom: 28,
-          width: 'min(700px, calc(100vw - 56px))',
+          width: 'min(760px, calc(100vw - 56px))',
           padding: '18px 20px',
           borderRadius: 18,
           border: '1px solid rgba(160, 230, 255, 0.25)',
@@ -1128,7 +1159,7 @@ export default function WebGPUFFTProbe() {
             color: 'rgba(205, 244, 255, 0.9)',
           }}
         >
-          OceanShader Pro / v0.18.6
+          OceanShader Pro / v0.19.0
         </p>
 
         <h1
@@ -1139,7 +1170,7 @@ export default function WebGPUFFTProbe() {
             letterSpacing: '-0.055em',
           }}
         >
-          Modular GPU IFFT Foundation
+          Strict Tessendorf IFFT Pipeline
         </h1>
 
         <p
